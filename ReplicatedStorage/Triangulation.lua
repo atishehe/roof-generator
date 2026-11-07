@@ -1,7 +1,53 @@
+--[[
+	Triangulation
+
+	Turns a folder of wall parts into a 2D floor polygon on the XZ plane and
+	triangulates it. Handy for generating floors/ceilings, checking if a point
+	is inside a room, getting spawn areas, etc.
+
+	All 2D math here works on plain tables {x = number, z = number}, not
+	Vector2/Vector3. Y is ignored everywhere except the debug renderers.
+
+	Typical use:
+
+		local Triangulation = require(path.to.Triangulation)
+		local room = Triangulation.fromWalls(workspace.Room.Walls)
+		if room then
+			print(room.area, #room.triangles)
+			Triangulation.debugRender(room.polygon)
+			Triangulation.debugRenderTriangles(room.polygon, room.triangles)
+		end
+
+	fromWalls() returns:
+		polygon      - outer boundary, counter-clockwise, list of {x, z}
+		triangles    - list of {i, j, k} indices into polygon
+		area         - area of the polygon (studs^2)
+		centroid     - average of the vertices (not the true area centroid)
+		aabb         - {minX, maxX, minZ, maxZ}
+		edgeNormals  - per-edge {a, b, normal, midpoint}, normals face outward
+
+	Assumptions about the walls:
+		- Each wall is a BasePart whose length runs along its local X axis.
+		- Wall ends that are within WALL_SNAP studs of each other count as
+		  the same corner. Bump snapTol up if your walls don't quite meet.
+		- If a closed boundary can't be found, we fall back to the bounding
+		  box of all wall endpoints so callers always get *something*.
+
+	Winding: "counter-clockwise" here means signedArea() > 0 using
+	x * z' - x' * z. Everything that cares about orientation calls
+	ensureCCW() first, so you can pass polygons in either order.
+]]
+
 local Triangulation = {}
 
+-- General float tolerance for cross products, determinants etc.
 local EPSILON = 1e-6
+-- Default distance (studs) under which two wall endpoints are merged.
 local WALL_SNAP = 0.5
+
+---------------------------------------------------------------------------
+-- Small 2D vector helpers (x/z)
+---------------------------------------------------------------------------
 
 local function v2(x, z)
 	return {x = x, z = z}
@@ -23,6 +69,8 @@ local function v2Dot(a, b)
 	return a.x * b.x + a.z * b.z
 end
 
+-- 2D cross product (z-component of the 3D cross). Positive means b is
+-- counter-clockwise from a.
 local function v2Cross(a, b)
 	return a.x * b.z - a.z * b.x
 end
@@ -31,17 +79,20 @@ local function v2Len(a)
 	return math.sqrt(a.x * a.x + a.z * a.z)
 end
 
+-- Returns a zero vector instead of NaNs for zero-length input.
 local function v2Normalize(a)
 	local len = v2Len(a)
 	if len < EPSILON then return v2(0, 0) end
 	return v2(a.x / len, a.z / len)
 end
 
+-- Loose equality check, defaults to the wall snap distance.
 local function v2Eq(a, b, tol)
 	tol = tol or WALL_SNAP
 	return math.abs(a.x - b.x) < tol and math.abs(a.z - b.z) < tol
 end
 
+-- Exposed so other modules can reuse the same vector format.
 Triangulation.v2 = v2
 Triangulation.v2Sub = v2Sub
 Triangulation.v2Add = v2Add
@@ -52,6 +103,11 @@ Triangulation.v2Len = v2Len
 Triangulation.v2Normalize = v2Normalize
 Triangulation.v2Eq = v2Eq
 
+---------------------------------------------------------------------------
+-- Basic polygon info
+---------------------------------------------------------------------------
+
+-- Shoelace formula. Sign tells you the winding (positive = CCW).
 function Triangulation.signedArea(poly)
 	local sum = 0
 	local n = #poly
@@ -70,6 +126,8 @@ function Triangulation.isCounterClockwise(poly)
 	return Triangulation.signedArea(poly) > 0
 end
 
+-- Returns a reversed copy if the polygon is clockwise, otherwise the
+-- same table (not a copy).
 function Triangulation.ensureCCW(poly)
 	if not Triangulation.isCounterClockwise(poly) then
 		local reversed = {}
@@ -81,6 +139,8 @@ function Triangulation.ensureCCW(poly)
 	return poly
 end
 
+-- Vertex average. Good enough for labels/camera targets, but for very
+-- uneven vertex spacing it won't match the real center of mass.
 function Triangulation.centroid(poly)
 	local cx, cz = 0, 0
 	local n = #poly
@@ -91,6 +151,12 @@ function Triangulation.centroid(poly)
 	return v2(cx / n, cz / n)
 end
 
+---------------------------------------------------------------------------
+-- Geometry tests used by the ear clipper
+---------------------------------------------------------------------------
+
+-- Barycentric point-in-triangle test. Points on the edges count as inside
+-- (within EPSILON), which is what we want for rejecting ears.
 local function pointInTriangle(p, a, b, c)
 	local v0 = v2Sub(c, a)
 	local v1 = v2Sub(b, a)
@@ -102,6 +168,7 @@ local function pointInTriangle(p, a, b, c)
 	local dot11 = v2Dot(v1, v1)
 	local dot12 = v2Dot(v1, v2p)
 
+	-- Degenerate (flat) triangle, nothing can be inside it.
 	local inv = dot00 * dot11 - dot01 * dot01
 	if math.abs(inv) < EPSILON then return false end
 	inv = 1 / inv
@@ -111,6 +178,9 @@ local function pointInTriangle(p, a, b, c)
 
 	return u >= -EPSILON and v >= -EPSILON and (u + v) <= 1 + EPSILON
 end
+
+-- True only for a proper crossing in the middle of both segments.
+-- Touching at endpoints and parallel/collinear segments return false.
 local function segmentsIntersect(p1, p2, p3, p4)
 	local d1 = v2Sub(p2, p1)
 	local d2 = v2Sub(p4, p3)
@@ -124,6 +194,19 @@ local function segmentsIntersect(p1, p2, p3, p4)
 	return t > EPSILON and t < (1 - EPSILON) and u > EPSILON and u < (1 - EPSILON)
 end
 
+---------------------------------------------------------------------------
+-- Ear clipping
+---------------------------------------------------------------------------
+
+-- Triangulates a simple polygon (no holes, no self intersections).
+-- Returns a list of {i, j, k} index triples into the CCW version of poly.
+--
+-- Note: if poly was clockwise, the indices refer to the reversed polygon,
+-- not the one you passed in. fromWalls() avoids this by passing an
+-- already-CCW polygon.
+--
+-- O(n^3) worst case, which is fine for room outlines but not for
+-- huge meshes.
 function Triangulation.triangulate(poly)
 	local n = #poly
 	if n < 3 then return {} end
@@ -131,9 +214,13 @@ function Triangulation.triangulate(poly)
 
 	poly = Triangulation.ensureCCW(poly)
 
+	-- Vertices still left to clip. We remove from this list, not from poly,
+	-- so the output indices stay valid.
 	local indices = {}
 	for i = 1, n do indices[i] = i end
 
+	-- Is the corner at position idx (in `indices`) convex? With CCW winding
+	-- a left turn (positive cross) means convex.
 	local function isConvex(idx)
 		local count = #indices
 		local prev = indices[((idx - 2) % count) + 1]
@@ -144,6 +231,9 @@ function Triangulation.triangulate(poly)
 		return v2Cross(edge1, edge2) > EPSILON
 	end
 
+	-- Can we cut off the triangle (prev, curr, next)? It must not contain any
+	-- other remaining vertex, and the new diagonal prev->next must not cross
+	-- any remaining edge.
 	local function isDiagonalInside(idx)
 		local count = #indices
 		local prevIdx = ((idx - 2) % count) + 1
@@ -167,6 +257,8 @@ function Triangulation.triangulate(poly)
 			local jNext = (j % count) + 1
 			local eA = poly[indices[j]]
 			local eB = poly[indices[jNext]]
+			-- Edges sharing an endpoint with the diagonal always "touch" it,
+			-- so skip them.
 			if indices[j] == prev or indices[j] == next or indices[jNext] == prev or indices[jNext] == next then
 				continue
 			end
@@ -182,6 +274,7 @@ function Triangulation.triangulate(poly)
 	local safety = 0
 	local maxIter = n * n
 
+	-- Clip one ear per pass until only a triangle is left.
 	while #indices > 3 and safety < maxIter do
 		safety += 1
 		local earFound = false
@@ -203,6 +296,8 @@ function Triangulation.triangulate(poly)
 			end
 		end
 
+		-- Usually means duplicate/collinear points or a self-intersecting
+		-- outline. We return whatever we managed to clip.
 		if not earFound then
 			warn("[Triangulation] No ear found with " .. #indices .. " vertices remaining — polygon may be degenerate")
 			break
@@ -216,6 +311,13 @@ function Triangulation.triangulate(poly)
 	return triangles
 end
 
+---------------------------------------------------------------------------
+-- Edges / bounds
+---------------------------------------------------------------------------
+
+-- One entry per edge with its outward-facing unit normal and midpoint.
+-- For a CCW polygon, rotating the edge direction clockwise (z, -x)
+-- points away from the interior.
 function Triangulation.edgeNormals(poly)
 	poly = Triangulation.ensureCCW(poly)
 	local normals = {}
@@ -245,6 +347,14 @@ function Triangulation.aabb(poly)
 	end
 	return {minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ}
 end
+
+---------------------------------------------------------------------------
+-- Walls -> boundary polygon
+---------------------------------------------------------------------------
+
+-- Converts each wall part into a 2D segment between its two ends.
+-- The wall's length is assumed to be its Size.X, so rotate walls with
+-- that in mind. Thickness and height are ignored.
 function Triangulation.extractWallSegments(wallsFolder)
 	local segments = {}
 	for _, wall in ipairs(wallsFolder:GetChildren()) do
@@ -262,6 +372,13 @@ function Triangulation.extractWallSegments(wallsFolder)
 	return segments
 end
 
+-- Groups endpoints that are within `tolerance` of each other and moves
+-- them all to the group's average. This fixes walls that overlap or stop
+-- slightly short at corners.
+--
+-- Heads up: this edits the points inside `segments` in place.
+-- Clustering is greedy (first point found becomes the anchor), which is
+-- fine as long as real corners are further apart than the tolerance.
 local function snapEndpoints(segments, tolerance)
 	tolerance = tolerance or WALL_SNAP
 	local allPts = {}
@@ -299,6 +416,11 @@ local function snapEndpoints(segments, tolerance)
 	return clusters
 end
 
+-- Builds an undirected graph from the (snapped) segments.
+-- Nodes are keyed by their coordinates rounded to 2 decimals, so snapped
+-- points that are basically equal end up as the same node.
+--
+-- Returns: nodeMap[key] = {pt = {x, z}, neighbors = {[key] = node}}
 local function buildGraph(segments, snapTol)
 	snapEndpoints(segments, snapTol)
 
@@ -318,6 +440,7 @@ local function buildGraph(segments, snapTol)
 		local nB = getOrAdd(seg.b)
 		local kA = key(seg.a)
 		local kB = key(seg.b)
+		-- Skip walls that collapsed to a single point after snapping.
 		if kA ~= kB then
 			nA.neighbors[kB] = nB
 			nB.neighbors[kA] = nA
@@ -327,6 +450,19 @@ local function buildGraph(segments, snapTol)
 	return nodeMap
 end
 
+-- Finds the outer outline of the walls.
+--
+-- How it works: treat the walls as a planar graph and walk every face.
+-- At each node we sort neighbours by angle, and when we arrive along an
+-- edge we leave by the next edge in clockwise order. Following that rule
+-- traces closed loops (faces). Every directed edge belongs to exactly one
+-- face, so we mark them as visited and don't trace the same loop twice.
+--
+-- Of all the loops found, we keep the one with the largest positive
+-- signed area, which for a normal set of walls is the outer boundary.
+-- Interior walls just split the inside into smaller faces that lose.
+--
+-- Returns a CCW polygon, or {} if nothing closed was found.
 function Triangulation.extractOuterBoundary(segments, snapTol)
 	if #segments == 0 then return {} end
 
@@ -334,6 +470,7 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 	local graph = buildGraph(segments, snapTol)
 	local directedVisited = {}
 
+	-- Must match the key format used in buildGraph.
 	local function key(pt)
 		return string.format("%.2f,%.2f", pt.x, pt.z)
 	end
@@ -346,6 +483,7 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 		return math.atan2(toPt.z - fromPt.z, toPt.x - fromPt.x)
 	end
 
+	-- Precompute each node's neighbours sorted by angle (counter-clockwise).
 	local sortedNeighbors = {}
 	for nodeKey, node in pairs(graph) do
 		local neighbors = {}
@@ -361,6 +499,9 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 		sortedNeighbors[nodeKey] = neighbors
 	end
 
+	-- Walks one face starting with the directed edge startKey -> nextKey.
+	-- Returns the face's points, or nil if the walk hits a dead end or
+	-- doesn't close.
 	local function traceFace(startKey, nextKey)
 		local face = {}
 		local currentKey = startKey
@@ -378,6 +519,7 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 				return nil
 			end
 
+			-- Find the edge we came in on, as seen from the next node...
 			local incomingIndex = nil
 			for i, entry in ipairs(around) do
 				if entry.key == currentKey then
@@ -389,6 +531,9 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 				return nil
 			end
 
+			-- ...and take the one just before it (next one clockwise).
+			-- At a dead-end wall this wraps back to the same edge, so the
+			-- walk goes around the end and back down the other side.
 			local nextIndex = incomingIndex - 1
 			if nextIndex < 1 then
 				nextIndex = #around
@@ -396,6 +541,7 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 
 			local newCurrent = neighborKey
 			local newNeighbor = around[nextIndex].key
+			-- Back at the starting edge, loop is closed.
 			if newCurrent == startKey and newNeighbor == nextKey then
 				break
 			end
@@ -407,6 +553,7 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 			return nil
 		end
 
+		-- Drop consecutive duplicates (and a duplicated closing point).
 		local cleaned = {}
 		for _, pt in ipairs(face) do
 			if #cleaned == 0 or not v2Eq(cleaned[#cleaned], pt, snapTol * 0.5) then
@@ -420,9 +567,13 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 			return nil
 		end
 
+		-- Remove points in the middle of straight runs (e.g. where two
+		-- walls meet end to end along the same line).
 		return Triangulation.simplify(cleaned)
 	end
 
+	-- Try every directed edge not already used by a traced face, keep the
+	-- biggest CCW loop.
 	local bestFace = nil
 	local bestArea = 0
 	for fromKey, node in pairs(graph) do
@@ -449,12 +600,19 @@ function Triangulation.extractOuterBoundary(segments, snapTol)
 	return Triangulation.ensureCCW(bestFace)
 end
 
-
+-- Main entry point. Give it a folder of wall parts and get back the room
+-- outline, its triangulation and a few handy extras (see the top of the
+-- file). Returns nil if the folder has no BaseParts.
+--
+-- snapTol is optional, defaults to WALL_SNAP.
 function Triangulation.fromWalls(wallsFolder, snapTol)
 	local segments = Triangulation.extractWallSegments(wallsFolder)
 	if #segments == 0 then return nil end
 
 	local polygon = Triangulation.extractOuterBoundary(segments, snapTol)
+
+	-- Couldn't find a closed outline (gaps bigger than snapTol, stray walls,
+	-- etc). Fall back to a rectangle around all the wall endpoints.
 	if #polygon < 3 then
 		local aabb = Triangulation.aabb(
 			(function()
@@ -487,6 +645,12 @@ function Triangulation.fromWalls(wallsFolder, snapTol)
 	}
 end
 
+---------------------------------------------------------------------------
+-- Misc polygon utilities
+---------------------------------------------------------------------------
+
+-- Even-odd ray cast along +X. Works for any winding. Points exactly on an
+-- edge can go either way.
 function Triangulation.pointInPolygon(poly, pt)
 	local inside = false
 	local n = #poly
@@ -494,6 +658,7 @@ function Triangulation.pointInPolygon(poly, pt)
 	for i = 1, n do
 		local pi = poly[i]
 		local pj = poly[j]
+		-- Only edges that straddle the ray's z can be crossed.
 		if (pi.z > pt.z) ~= (pj.z > pt.z) then
 			local intersectX = pj.x + (pt.z - pj.z) / (pi.z - pj.z) * (pi.x - pj.x)
 			if pt.x < intersectX then
@@ -505,6 +670,14 @@ function Triangulation.pointInPolygon(poly, pt)
 	return inside
 end
 
+-- Moves every vertex along its corner bisector so each edge ends up
+-- `dist` studs from where it was.
+--   positive dist -> shrinks the polygon (inset, e.g. keep away from walls)
+--   negative dist -> grows it
+--
+-- This is a simple per-vertex offset, not a full polygon offset. Very
+-- sharp corners are clamped to 3x dist so they don't shoot off, and large
+-- insets on thin shapes can make the result self-intersect.
 function Triangulation.offsetPolygon(poly, dist)
 	poly = Triangulation.ensureCCW(poly)
 	local n = #poly
@@ -516,13 +689,17 @@ function Triangulation.offsetPolygon(poly, dist)
 		local curr = poly[i]
 		local next = poly[(i % n) + 1]
 
+		-- Directions of the edges coming into and leaving this corner.
 		local e1 = v2Normalize(v2Sub(curr, prev))
 		local e2 = v2Normalize(v2Sub(next, curr))
 
+		-- Their outward normals, and the direction halfway between them.
 		local n1 = v2(e1.z, -e1.x)
 		local n2 = v2(e2.z, -e2.x)
 
 		local bisector = v2Normalize(v2Add(n1, n2))
+		-- How far along the bisector we need to move so the edges shift by
+		-- exactly `dist`. Guard against a zero (180 degree spike).
 		local sinHalf = v2Cross(e2, bisector)
 		if math.abs(sinHalf) < EPSILON then sinHalf = 1 end
 
@@ -536,7 +713,10 @@ function Triangulation.offsetPolygon(poly, dist)
 	return offsetPts
 end
 
-
+-- Removes vertices that sit on a straight line between their neighbours.
+-- angleTol is compared against the sine of the turn angle (default 0.01,
+-- roughly half a degree). Returns the original if simplifying would leave
+-- fewer than 3 points.
 function Triangulation.simplify(poly, angleTol)
 	angleTol = angleTol or 0.01
 	local result = {}
@@ -556,6 +736,12 @@ function Triangulation.simplify(poly, angleTol)
 	return result
 end
 
+---------------------------------------------------------------------------
+-- Debug drawing
+---------------------------------------------------------------------------
+
+-- Draws the polygon outline as neon parts at height y, with a yellow ball
+-- on each vertex. Returns the folder so you can :Destroy() it later.
 function Triangulation.debugRender(poly, y, parent, color)
 	color = color or Color3.fromRGB(0, 255, 100)
 	y = y or 5
@@ -576,6 +762,8 @@ function Triangulation.debugRender(poly, y, parent, color)
 		local p = Instance.new("Part")
 		p.Name = "Edge_" .. i
 		p.Size = Vector3.new(len, 0.3, 0.3)
+		-- lookAt points -Z at b; the extra 90 degree turn lines the part's
+		-- X axis (its length) up with the edge instead.
 		p.CFrame = CFrame.lookAt(mid, b) * CFrame.Angles(0, math.rad(90), 0)
 		p.Anchored = true
 		p.CanCollide = false
@@ -604,6 +792,9 @@ function Triangulation.debugRender(poly, y, parent, color)
 	return folder
 end
 
+-- Draws every triangle's edges as thin neon parts. Drawn slightly above
+-- debugRender's default height so the two don't z-fight. Shared edges get
+-- drawn twice, which is fine for debugging.
 function Triangulation.debugRenderTriangles(poly, tris, y, parent, color)
 	color = color or Color3.fromRGB(100, 200, 255)
 	y = y or 5.1
