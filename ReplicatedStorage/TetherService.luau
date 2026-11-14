@@ -1,11 +1,9 @@
 --!strict
--- Study copy of src/server/Voyage/TetherService.luau with notes. Not synced, not used by the game.
 --
 -- Harpoon rope. A player shoots a harpoon; if it sticks in another ship, a floating drowned or a monster, a rope
 -- links that thing to the shooter's ship. Players on the reel shorten or lengthen the rope, and a tight rope pulls
 -- both ends together. It is NOT a RopeConstraint: physics ropes go unstable on huge or welded models, so the rope
 -- is just a number (length) checked every frame against the real distance between its two ends.
--- The maths (force, strain, sag, reel speed) lives in Logic/Tether so it can be unit tested outside Roblox.
 
 local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
