@@ -1,5 +1,6 @@
 --!strict
---
+-- @discord: nuttynutella
+-- @robloxId: Chandalatish
 -- Harpoon rope. A player shoots a harpoon; if it sticks in another ship, a floating drowned or a monster, a rope
 -- links that thing to the shooter's ship. Players on the reel shorten or lengthen the rope, and a tight rope pulls
 -- both ends together. It is NOT a RopeConstraint: physics ropes go unstable on huge or welded models, so the rope
